@@ -58,11 +58,17 @@ except:
     # 'antialias' resampling is not available
     pass
 
+import multiprocessing
+import tempfile
+from optparse import OptionParser, OptionGroup
+
 __version__ = "$Id$"
 
 resampling_list = ('average','near','bilinear','cubic','cubicspline','lanczos','antialias')
 profile_list = ('mercator','geodetic','raster') #,'zoomify')
 webviewer_list = ('all','google','openlayers','none')
+cpu_count = multiprocessing.cpu_count()
+queue = multiprocessing.Queue()
 
 # =============================================================================
 # =============================================================================
@@ -650,7 +656,6 @@ gdal_vrtmerge.py -o merged.vrt %s""" % " ".join(self.args))
     def optparse_init(self):
         """Prepare the option parser for input (argv)"""
 
-        from optparse import OptionParser, OptionGroup
         usage = "Usage: %prog [options] input_file(s) [output]"
         p = OptionParser(usage, version="%prog "+ __version__)
         p.add_option("-p", "--profile", dest='profile', type='choice', choices=profile_list,
@@ -711,7 +716,10 @@ gdal_vrtmerge.py -o merged.vrt %s""" % " ".join(self.args))
     def open_input(self):
         """Initialization of the input raster, reprojection if necessary"""
 
+        gdal.UseExceptions()
         gdal.AllRegister()
+        if not self.options.verbose:
+            gdal.PushErrorHandler('CPLQuietErrorHandler')
 
         # Initialize necessary GDAL drivers
 
@@ -828,8 +836,7 @@ gdal2tiles temp.vrt""" % self.input )
 
                     # Correction of AutoCreateWarpedVRT for NODATA values
                     if self.in_nodata != []:
-                        import tempfile
-                        tempfilename = tempfile.mktemp('-gdal2tiles.vrt')
+                        fd, tempfilename = tempfile.mkstemp('-gdal2tiles.vrt')
                         self.out_ds.GetDriver().CreateCopy(tempfilename, self.out_ds)
                         # open as a text file
                         s = open(tempfilename).read()
@@ -863,8 +870,7 @@ gdal2tiles temp.vrt""" % self.input )
                     # Correction of AutoCreateWarpedVRT for Mono (1 band) and RGB (3 bands) files without NODATA:
                     # equivalent of gdalwarp -dstalpha
                     if self.in_nodata == [] and self.out_ds.RasterCount in [1,3]:
-                        import tempfile
-                        tempfilename = tempfile.mktemp('-gdal2tiles.vrt')
+                        fd, tempfilename = tempfile.mkstemp('-gdal2tiles.vrt')
                         self.out_ds.GetDriver().CreateCopy(tempfilename, self.out_ds)
                         # open as a text file
                         s = open(tempfilename).read()
@@ -1151,10 +1157,8 @@ gdal2tiles temp.vrt""" % self.input )
                     f.close()
 
     # -------------------------------------------------------------------------
-    def generate_base_tiles(self):
+    def generate_base_tiles(self, cpu):
         """Generation of the base tiles (the lowest in the pyramid) directly from the input raster"""
-
-        print("Generating Base Tiles:")
 
         if self.options.verbose:
             #mx, my = self.out_gt[0], self.out_gt[3] # OriginX, OriginY
@@ -1195,6 +1199,8 @@ gdal2tiles temp.vrt""" % self.input )
                 if self.stopped:
                     break
                 ti += 1
+                if (ti - 1) % cpu_count != cpu:
+                    continue
                 tilefilename = os.path.join(self.output, str(tz), str(tx), "%s.%s" % (ty, self.tileext))
                 if self.options.verbose:
                     print(ti,'/',tcount, tilefilename) #, "( TileMapService: z / x / y )"
@@ -1203,7 +1209,7 @@ gdal2tiles temp.vrt""" % self.input )
                     if self.options.verbose:
                         print("Tile generation skiped because of --resume")
                     else:
-                        self.progressbar( ti / float(tcount) )
+                        queue.put(tcount)
                     continue
 
                 # Create directories for the tile
@@ -1308,7 +1314,7 @@ gdal2tiles temp.vrt""" % self.input )
                         f.close()
 
                 if not self.options.verbose:
-                    self.progressbar( ti / float(tcount) )
+                    queue.put(tcount)
 
     # -------------------------------------------------------------------------
     def generate_overview_tiles(self):
@@ -2271,8 +2277,47 @@ gdal2tiles temp.vrt""" % self.input )
 # =============================================================================
 # =============================================================================
 
+def worker_metadata(argv):
+        gdal2tiles = GDAL2Tiles( argv[1:] )
+        gdal2tiles.open_input()
+        gdal2tiles.generate_metadata()
+
+def worker_base_tiles(argv, cpu):
+        gdal2tiles = GDAL2Tiles( argv[1:] )
+        gdal2tiles.open_input()
+        gdal2tiles.generate_base_tiles(cpu)
+
+def worker_overview_tiles(argv):
+        gdal2tiles = GDAL2Tiles( argv[1:] )
+        gdal2tiles.open_input()
+        gdal2tiles.generate_overview_tiles()
+
 if __name__=='__main__':
     argv = gdal.GeneralCmdLineProcessor( sys.argv )
     if argv:
-        gdal2tiles = GDAL2Tiles( argv[1:] )
-        gdal2tiles.process()
+        tmp = GDAL2Tiles( argv[1:] ) # handle --help
+        del tmp
+
+        p = multiprocessing.Process(target=worker_metadata, args=[argv])
+        p.start()
+        p.join()
+
+        pool = multiprocessing.Pool()
+        processed_tiles = 0
+        print("Generating Base Tiles:")
+        for cpu in range(cpu_count):
+            pool.apply_async(worker_base_tiles, [argv, cpu])
+        pool.close()
+        while len(multiprocessing.active_children()) != 0:
+            try:
+                total = queue.get(timeout=1)
+                processed_tiles += 1
+                gdal.TermProgress_nocb(processed_tiles / float(total))
+                sys.stdout.flush()
+            except:
+                pass
+        pool.join()
+
+        p = multiprocessing.Process(target=worker_overview_tiles, args=[argv])
+        p.start()
+        p.join()
